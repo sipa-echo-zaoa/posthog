@@ -530,19 +530,19 @@ def sync_issue_to_clickhouse(issue_id: UUID, team_id: int) -> None:
         return
 
     assignment = ErrorTrackingIssueAssignment.objects.filter(issue_id=issue_id).first()
-    fingerprints = list(
+    fingerprint_records = list(
         ErrorTrackingIssueFingerprintV2.objects.filter(team_id=team_id, issue_id=issue_id).values_list(
-            "fingerprint", flat=True
+            "fingerprint", "first_seen"
         )
     )
 
-    if not fingerprints:
+    if not fingerprint_records:
         return
 
     version = int(time.time() * 1000)
     p = ClickhouseProducer()
 
-    for fingerprint in fingerprints:
+    for fingerprint, first_seen in fingerprint_records:
         p.produce(
             topic=KAFKA_ERROR_TRACKING_ISSUE_FINGERPRINT_DENORMALIZED,
             sql=INSERT_ERROR_TRACKING_ISSUE_FINGERPRINT_DENORMALIZED,
@@ -555,6 +555,7 @@ def sync_issue_to_clickhouse(issue_id: UUID, team_id: int) -> None:
                 "issue_status": issue.status,
                 "assigned_user_id": assignment.user_id if assignment else None,
                 "assigned_role_id": str(assignment.role_id) if assignment and assignment.role_id else None,
+                "first_seen": first_seen.strftime("%Y-%m-%d %H:%M:%S.%f") if first_seen else "1970-01-01 00:00:00.000",
                 "is_deleted": 0,
                 "version": version,
             },
