@@ -11,12 +11,18 @@ from django_deprecate_fields import deprecate_field
 from rest_framework.exceptions import ValidationError
 
 from posthog.kafka_client.client import ClickhouseProducer
-from posthog.kafka_client.topics import KAFKA_ERROR_TRACKING_ISSUE_FINGERPRINT
+from posthog.kafka_client.topics import (
+    KAFKA_ERROR_TRACKING_ISSUE_FINGERPRINT,
+    KAFKA_ERROR_TRACKING_ISSUE_FINGERPRINT_DENORMALIZED,
+)
 from posthog.models.integration import Integration
 from posthog.models.utils import UUIDModel, UUIDTModel
 from posthog.storage import object_storage
 
-from products.error_tracking.backend.sql import INSERT_ERROR_TRACKING_ISSUE_FINGERPRINT_OVERRIDES
+from products.error_tracking.backend.sql import (
+    INSERT_ERROR_TRACKING_ISSUE_FINGERPRINT_DENORMALIZED,
+    INSERT_ERROR_TRACKING_ISSUE_FINGERPRINT_OVERRIDES,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -507,6 +513,57 @@ def delete_symbol_set_contents(upload_path: str) -> None:
             code="object_storage_required",
             detail="Object storage must be available to delete source maps.",
         )
+
+
+def sync_issue_to_clickhouse(issue_id: UUID, team_id: int) -> None:
+    """Syncs all denormalized issue metadata to the V2 fingerprint overrides table in ClickHouse.
+
+    Fetches issue fields, assignment, and all fingerprints from Postgres, then produces
+    a Kafka message per fingerprint with all denormalized fields.
+    """
+    import time
+
+    try:
+        issue = ErrorTrackingIssue.objects.get(id=issue_id, team_id=team_id)
+    except ErrorTrackingIssue.DoesNotExist:
+        logger.warning("sync_issue_to_clickhouse: issue not found", issue_id=issue_id, team_id=team_id)
+        return
+
+    assignment = ErrorTrackingIssueAssignment.objects.filter(issue_id=issue_id).first()
+    fingerprints = list(
+        ErrorTrackingIssueFingerprintV2.objects.filter(team_id=team_id, issue_id=issue_id).values_list(
+            "fingerprint", flat=True
+        )
+    )
+
+    if not fingerprints:
+        return
+
+    version = int(time.time() * 1000)
+    p = ClickhouseProducer()
+
+    for fingerprint in fingerprints:
+        p.produce(
+            topic=KAFKA_ERROR_TRACKING_ISSUE_FINGERPRINT_DENORMALIZED,
+            sql=INSERT_ERROR_TRACKING_ISSUE_FINGERPRINT_DENORMALIZED,
+            data={
+                "team_id": team_id,
+                "fingerprint": fingerprint,
+                "issue_id": str(issue.id),
+                "issue_name": issue.name,
+                "issue_description": issue.description,
+                "issue_status": issue.status,
+                "assigned_user_id": assignment.user_id if assignment else None,
+                "assigned_role_id": str(assignment.role_id) if assignment and assignment.role_id else None,
+                "is_deleted": 0,
+                "version": version,
+            },
+        )
+
+
+def sync_issues_to_clickhouse(issue_ids: list[UUID], team_id: int) -> None:
+    for issue_id in issue_ids:
+        sync_issue_to_clickhouse(issue_id=issue_id, team_id=team_id)
 
 
 class ErrorTrackingSpikeDetectionConfig(models.Model):
