@@ -32,6 +32,12 @@ python manage.py apply_persons_migrations --database=persons_db_writer --ensure-
 echo "==> Downloading GeoIP database..."
 bin/download-mmdb || true
 
+# Generate demo data on first boot (creates test@posthog.com / 12345678)
+if ! python manage.py shell -c "from posthog.models import Organization; exit(0 if Organization.objects.exists() else 1)" 2>/dev/null; then
+    echo "==> Generating demo data (first boot)..."
+    python manage.py generate_demo_data
+fi
+
 echo "==> Starting PostHog via mprocs in tmux..."
 # Run bin/start inside tmux so mprocs gets a real TTY.
 # -L sandbox starts a new server that inherits our full environment.
