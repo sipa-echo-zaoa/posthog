@@ -57,6 +57,19 @@ services:
             PERSONS_READ_DATABASE_URL: 'postgres://posthog:posthog@db:5432/posthog'
             PERSONS_DATABASE_URL: 'postgres://posthog:posthog@db:5432/posthog'
             BEHAVIORAL_COHORTS_DATABASE_URL: 'postgres://posthog:posthog@db:5432/posthog'
+            # Temporal runs as a compose service, not on localhost
+            TEMPORAL_HOST: 'temporal'
+            # NodeJS plugin server needs these
+            CDP_REDIS_HOST: 'redis7'
+            CDP_API_URL: 'http://localhost:6738'
+            SESSION_RECORDING_API_REDIS_HOST: 'redis7'
+            SESSION_RECORDING_API_REDIS_PORT: '6379'
+            ENCRYPTION_SALT_KEYS: '00beef0000beef0000beef0000beef00'
+            # ClickHouse credentials for Celery workers
+            CLICKHOUSE_API_USER: 'api'
+            CLICKHOUSE_API_PASSWORD: 'apipass'
+            CLICKHOUSE_APP_USER: 'app'
+            CLICKHOUSE_APP_PASSWORD: 'apppass'
             # Tell Django where the browser can reach the Vite dev server
             JS_URL: 'http://localhost:${SANDBOX_VITE_PORT:-49001}'
             # DuckLake connects to Postgres — point at the compose service, not localhost

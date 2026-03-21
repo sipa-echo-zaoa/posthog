@@ -748,7 +748,3 @@ environment:
         description: Disable anonymous usage telemetry
     telemetry:status:
         description: Show current telemetry settings
-    sandbox:entrypoint:
-        bin_script: sandbox-entrypoint.sh
-        description: 'TODO: add description for sandbox-entrypoint.sh'
-        hidden: true
