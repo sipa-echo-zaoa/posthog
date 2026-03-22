@@ -1,11 +1,13 @@
 import json
 import uuid as uuid_mod
+from datetime import timedelta
 from typing import Optional, cast
 
 from django.db.models import QuerySet
 
 import structlog
 import posthoganalytics
+from dateutil.parser import isoparse
 from django_filters import BaseInFilter, CharFilter, FilterSet
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema
@@ -39,6 +41,8 @@ from posthog.models.hog_function_template import HogFunctionTemplate
 from posthog.plugins.plugin_server_api import create_hog_flow_invocation_test
 
 from products.workflows.backend.models.hog_flow_batch_job import HogFlowBatchJob
+from products.workflows.backend.models.hog_flow_scheduled_run import HogFlowScheduledRun
+from products.workflows.backend.utils.rrule_utils import compute_next_occurrences, validate_rrule
 
 logger = structlog.get_logger(__name__)
 
@@ -192,6 +196,22 @@ class HogFlowMaskingSerializer(serializers.Serializer):
         return super().validate(attrs)
 
 
+class HogFlowScheduledRunSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = HogFlowScheduledRun
+        fields = [
+            "id",
+            "run_at",
+            "status",
+            "batch_job",
+            "started_at",
+            "completed_at",
+            "failure_reason",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
 class HogFlowMinimalSerializer(serializers.ModelSerializer):
     created_by = UserBasicSerializer(read_only=True)
 
@@ -215,6 +235,7 @@ class HogFlowMinimalSerializer(serializers.ModelSerializer):
             "abort_action",
             "variables",
             "billable_action_types",
+            "schedule_config",
         ]
         read_only_fields = fields
 
@@ -252,6 +273,7 @@ class HogFlowSerializer(HogFlowMinimalSerializer):
             "abort_action",
             "variables",
             "billable_action_types",
+            "schedule_config",
         ]
         read_only_fields = [
             "id",
@@ -305,6 +327,40 @@ class HogFlowSerializer(HogFlowMinimalSerializer):
                     data["conversion"]["bytecode"] = compiled_filters.get("bytecode", [])
             if "bytecode" not in data["conversion"]:
                 data["conversion"]["bytecode"] = []
+
+        # Validate schedule_config if present and not a draft
+        schedule_config = data.get("schedule_config")
+        if schedule_config and not self.context.get("is_draft"):
+            rrule_str = schedule_config.get("rrule")
+            if not rrule_str:
+                raise serializers.ValidationError({"schedule_config": {"rrule": "RRULE string is required."}})
+
+            try:
+                validate_rrule(rrule_str)
+            except (ValueError, TypeError) as e:
+                logger.warning("Invalid RRULE encountered during validation", rrule=rrule_str, error=str(e))
+                raise serializers.ValidationError({"schedule_config": {"rrule": "Invalid RRULE."}})
+
+            if not schedule_config.get("starts_at"):
+                raise serializers.ValidationError({"schedule_config": {"starts_at": "Start date is required."}})
+
+            # Validate starts_at format
+            try:
+                starts_at = isoparse(schedule_config["starts_at"])
+            except ValueError:
+                raise serializers.ValidationError({"schedule_config": {"starts_at": "Invalid date format."}})
+
+            # Enforce minimum interval of 1 hour by checking actual occurrences
+            try:
+                sample = compute_next_occurrences(
+                    rrule_str, starts_at, timezone_str=schedule_config.get("timezone", "UTC"), count=2
+                )
+            except (KeyError, ValueError):
+                raise serializers.ValidationError({"schedule_config": {"timezone": "Invalid or unknown timezone."}})
+            if len(sample) == 2 and (sample[1] - sample[0]) < timedelta(hours=1):
+                raise serializers.ValidationError(
+                    {"schedule_config": {"rrule": "Schedules must run at most once per hour."}}
+                )
 
         return data
 
@@ -510,6 +566,13 @@ class HogFlowViewSet(TeamAndOrgViewSetMixin, LogEntryMixin, AppMetricsMixin, vie
             batch_jobs = HogFlowBatchJob.objects.filter(hog_flow=hog_flow, team=self.team).order_by("-created_at")
             serializer = HogFlowBatchJobSerializer(batch_jobs, many=True)
             return Response(serializer.data)
+
+    @action(detail=True, methods=["GET"])
+    def scheduled_runs(self, request: Request, *args, **kwargs):
+        hog_flow = self.get_object()
+        runs = HogFlowScheduledRun.objects.filter(hog_flow=hog_flow, team=self.team).order_by("-run_at")[:100]
+        serializer = HogFlowScheduledRunSerializer(runs, many=True)
+        return Response(serializer.data)
 
 
 class InternalHogFlowViewSet(TeamAndOrgViewSetMixin, LogEntryMixin, AppMetricsMixin, viewsets.ModelViewSet):
