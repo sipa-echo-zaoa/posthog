@@ -82,6 +82,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
+# Shared cache directories — mounted as named volumes in docker-compose.sandbox.yml.
+# Created with open permissions so any UID can write (container runs as host user).
+RUN mkdir -p /cache/uv /cache/pnpm /cache/pgdump && chmod 777 /cache/uv /cache/pnpm /cache/pgdump
+
 ENV NODE_ENV=development
 WORKDIR /workspace
 

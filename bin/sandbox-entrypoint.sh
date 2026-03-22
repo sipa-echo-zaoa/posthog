@@ -21,11 +21,17 @@ sed -i "s|http://localhost:8234|${JS_URL}|g" posthog/utils.py
 # When running as a non-root UID (the default — see docker-compose.sandbox.yml),
 # HOME and cache dirs point to unwritable locations. Redirect to /tmp.
 export HOME=/tmp/sandbox-home
-export UV_CACHE_DIR=/tmp/uv-cache
+export UV_CACHE_DIR=/cache/uv
+export UV_LINK_MODE=copy
 export XDG_CACHE_HOME=/tmp/sandbox-cache
 export COREPACK_ENABLE_AUTO_PIN=0
 export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 mkdir -p "$HOME" "$UV_CACHE_DIR" "$XDG_CACHE_HOME"
+
+# Point pnpm at the shared store volume (mounted at /cache/pnpm).
+# This is a content-addressable cache — all sandboxes benefit from each other's installs.
+# pnpm reads store-dir from npm_config_store_dir env var.
+export npm_config_store_dir=/cache/pnpm
 
 echo "==> Installing Python dependencies..."
 uv sync
@@ -42,10 +48,30 @@ echo "==> Installing Node dependencies..."
 # node_modules from posthog-worktree setup.
 CI=1 pnpm install --frozen-lockfile --prefer-offline 2>&1 || CI=1 pnpm install 2>&1
 
-echo "==> Running database migrations..."
+PG_DUMP="/cache/pgdump/posthog.sql"
+PERSONS_DUMP="/cache/pgdump/posthog_persons.sql"
+
+if [[ -f "$PG_DUMP" ]]; then
+    echo "==> Restoring database from migration cache..."
+    psql -h db -U posthog -d posthog -q < "$PG_DUMP"
+    psql -h db -U posthog -d posthog_persons -q < "$PERSONS_DUMP"
+    echo "==> Running migrations (applying delta, if any)..."
+else
+    echo "==> Running full database migrations (no cache found)..."
+fi
+
 python manage.py migrate --noinput
-python manage.py migrate_clickhouse
 python manage.py apply_persons_migrations --database=persons_db_writer --ensure-database
+
+# Cache the migrated database for future sandboxes.
+# Only write the cache if it didn't exist — avoids baking in feature-branch migrations.
+if [[ ! -f "$PG_DUMP" ]]; then
+    echo "==> Caching migrated database for future sandboxes..."
+    pg_dump -h db -U posthog posthog > "$PG_DUMP"
+    pg_dump -h db -U posthog posthog_persons > "$PERSONS_DUMP"
+fi
+
+python manage.py migrate_clickhouse
 
 echo "==> Downloading GeoIP database..."
 bin/download-mmdb || true

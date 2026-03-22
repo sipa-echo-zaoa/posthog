@@ -96,6 +96,11 @@ services:
             - "${SANDBOX_VITE_PORT:-49001}:8234"
         volumes:
             - ${SANDBOX_CODE:-.}:/workspace
+            # Shared caches — persist across sandboxes so the second one is fast.
+            # uv and pnpm download packages here; subsequent sandboxes get cache hits.
+            - uv-cache:/cache/uv
+            - pnpm-store:/cache/pnpm
+            - pg-cache:/cache/pgdump
         environment:
             # --- Sandbox identity ---
             POSTHOG_SANDBOX: '1'
@@ -104,6 +109,10 @@ services:
             SKIP_SERVICE_VERSION_REQUIREMENTS: '1'
             IS_BEHIND_PROXY: 'true'
             DISABLE_SECURE_SSL_REDIRECT: 'true'
+            # Unique cookie names per sandbox so multiple sandboxes on localhost
+            # don't overwrite each other's session/CSRF cookies.
+            SESSION_COOKIE_NAME: 'sessionid_${SANDBOX_PORT:-48001}'
+            CSRF_COOKIE_NAME: 'csrftoken_${SANDBOX_PORT:-48001}'
 
             # --- Core datastores (point at compose services, not localhost) ---
             DATABASE_URL: 'postgres://posthog:posthog@db:5432/posthog'
@@ -251,9 +260,9 @@ services:
             - --rpc-addr kafka:33145
             - --advertise-rpc-addr kafka:33145
             - --mode dev-container
-            - --smp 2
-            - --memory 3G
-            - --reserve-memory 500M
+            - --smp 1
+            - --memory 1G
+            - --reserve-memory 200M
             - --overprovisioned
             - --set redpanda.empty_seed_starts_cluster=false
             - --seeds kafka:33145
@@ -326,3 +335,12 @@ volumes:
     postgres-data:
     redpanda-data:
     clickhouse-data:
+    uv-cache:
+        name: sandbox-uv-cache
+        external: true
+    pnpm-store:
+        name: sandbox-pnpm-store
+        external: true
+    pg-cache:
+        name: sandbox-pg-cache
+        external: true

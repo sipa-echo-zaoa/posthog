@@ -149,6 +149,11 @@ cmd_create() {
 
     registry_save "$branch" "$slug" "$port" "$worktree_path"
 
+    # Ensure shared cache volumes exist (external: true means compose won't create them).
+    docker volume create sandbox-uv-cache   >/dev/null 2>&1 || true
+    docker volume create sandbox-pnpm-store >/dev/null 2>&1 || true
+    docker volume create sandbox-pg-cache   >/dev/null 2>&1 || true
+
     local vite_port=$((port + 1000))
     print_color blue "Starting sandbox '${project}' on port ${port} (Vite: ${vite_port})..."
     compose_env "$port" "$worktree_path" \
@@ -294,6 +299,20 @@ cmd_logs() {
     docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" logs -f app
 }
 
+cmd_rebuild_db_cache() {
+    print_color blue "Rebuilding database migration cache from master..."
+
+    # Remove existing dump so the next sandbox boot regenerates it.
+    # We run pg_dump inside a sandbox container (which has psql/pg_dump),
+    # but there's no running sandbox guaranteed here. Instead, use a
+    # lightweight container with the shared volume mounted.
+    docker run --rm -v sandbox-pg-cache:/cache/pgdump alpine \
+        sh -c "rm -f /cache/pgdump/*.sql"
+
+    success "Database cache cleared. The next 'sandbox create' will run full migrations and cache the result."
+    echo "For a clean master-based cache, create a sandbox on a master-based branch."
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -302,13 +321,14 @@ COMMAND="${1:-help}"
 shift || true
 
 case "$COMMAND" in
-    create)  cmd_create "$@" ;;
-    stop)    cmd_stop "$@" ;;
-    start)   cmd_start "$@" ;;
-    destroy) cmd_destroy "$@" ;;
-    list|ls) cmd_list ;;
-    shell)   cmd_shell "$@" ;;
-    logs)    cmd_logs "$@" ;;
+    create)           cmd_create "$@" ;;
+    stop)             cmd_stop "$@" ;;
+    start)            cmd_start "$@" ;;
+    destroy)          cmd_destroy "$@" ;;
+    list|ls)          cmd_list ;;
+    shell)            cmd_shell "$@" ;;
+    logs)             cmd_logs "$@" ;;
+    rebuild-db-cache) cmd_rebuild_db_cache ;;
     help)
         echo "PostHog Dev Sandbox Manager"
         echo ""
@@ -322,6 +342,7 @@ case "$COMMAND" in
         echo "  list                            List all sandboxes"
         echo "  shell <branch>                  Attach to the mprocs UI"
         echo "  logs <branch>                   Tail logs from a sandbox"
+        echo "  rebuild-db-cache                Clear the migration cache (next create rebuilds it)"
         echo ""
         echo "Examples:"
         echo "  sandbox create aspicer/cool-feature"
