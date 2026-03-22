@@ -86,4 +86,13 @@ ENV NODE_ENV=development
 WORKDIR /workspace
 
 COPY --chmod=755 bin/sandbox-entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
+
+# --- PRE-MERGE WORKAROUND (delete this block after merging to master) ---
+# See sandbox-entrypoint.sh for details.
+COPY bin/wait-for-docker     /usr/local/share/sandbox/bin/wait-for-docker
+COPY bin/mprocs.yaml         /usr/local/share/sandbox/bin/mprocs.yaml
+COPY bin/start-backend       /usr/local/share/sandbox/bin/start-backend
+COPY bin/start-rust-service  /usr/local/share/sandbox/bin/start-rust-service
+# --- END PRE-MERGE WORKAROUND ---
+
 ENTRYPOINT ["/usr/local/bin/sandbox-entrypoint.sh"]

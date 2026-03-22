@@ -154,24 +154,32 @@ cmd_create() {
     compose_env "$port" "$worktree_path" \
         docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" up -d --build
 
-    # Wait for Django to start accepting requests
-    print_color blue "Waiting for PostHog to start..."
-    local max_wait=300
+    # Wait for Django to start accepting requests.
+    # Cold boots take 10-15 min (deps install, migrations, Rust compilation).
+    print_color blue "Waiting for PostHog to start (cold boot can take 10-15 min)..."
+    local max_wait=1800
     local elapsed=0
     while [[ $elapsed -lt $max_wait ]]; do
         if curl -sf "http://localhost:${port}/_health" > /dev/null 2>&1; then
             break
         fi
-        sleep 5
-        elapsed=$((elapsed + 5))
-        echo "  ... waiting (${elapsed}s)"
+        sleep 10
+        elapsed=$((elapsed + 10))
+        # Show progress every 30s to avoid wall of noise
+        if (( elapsed % 30 == 0 )); then
+            echo "  ... still waiting (${elapsed}s)"
+        fi
     done
 
+    echo ""
     if [[ $elapsed -ge $max_wait ]]; then
-        print_color yellow "PostHog may still be starting up. Check logs with: sandbox logs ${branch}"
+        error "PostHog did not start after ${max_wait}s. Something is likely broken."
+        echo "Troubleshooting:"
+        echo "  Logs:   sandbox logs ${branch}"
+        echo "  Shell:  sandbox shell ${branch}"
+        exit 1
     fi
 
-    echo ""
     success "PostHog running at http://localhost:${port}"
     print_color blue "Worktree: ${worktree_path}"
     print_color blue "Shell:    sandbox shell ${branch}"

@@ -3,6 +3,21 @@ set -e
 
 cd /workspace
 
+# --- PRE-MERGE WORKAROUND (delete this block after merging to master) ---
+# The sandbox modifies several bin/ scripts and posthog/utils.py. Branches
+# that don't have those changes yet will fail to boot. This block overlays
+# the sandbox-aware versions from the Docker image onto the worktree.
+# Once this PR is merged, every branch inherits the changes and this
+# block does nothing useful (cp overwrites with identical files, sed is a no-op).
+echo "==> Applying sandbox script overlays..."
+cp /usr/local/share/sandbox/bin/wait-for-docker    bin/wait-for-docker
+cp /usr/local/share/sandbox/bin/mprocs.yaml        bin/mprocs.yaml
+cp /usr/local/share/sandbox/bin/start-backend      bin/start-backend
+cp /usr/local/share/sandbox/bin/start-rust-service bin/start-rust-service
+# Fix hardcoded Vite dev server port in older branches (no-op after merge).
+sed -i "s|http://localhost:8234|${JS_URL}|g" posthog/utils.py
+# --- END PRE-MERGE WORKAROUND ---
+
 # When running as a non-root UID (the default — see docker-compose.sandbox.yml),
 # HOME and cache dirs point to unwritable locations. Redirect to /tmp.
 export HOME=/tmp/sandbox-home
