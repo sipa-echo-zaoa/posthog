@@ -76,7 +76,7 @@ project_name() {
 
 # Require a branch to exist in the registry; fatal if not found.
 require_registered() {
-    local branch="$1" cmd="$2"
+    local branch="$1"
     local port
     port=$(registry_get "$branch" "port")
     if [[ -z "$port" ]]; then
@@ -180,7 +180,7 @@ cmd_create() {
 
 cmd_stop() {
     local branch="${1:?Branch name required. Usage: sandbox stop <branch>}"
-    require_registered "$branch" "stop"
+    require_registered "$branch"
 
     local project
     project=$(project_name "$branch")
@@ -193,7 +193,7 @@ cmd_stop() {
 
 cmd_start() {
     local branch="${1:?Branch name required. Usage: sandbox start <branch>}"
-    require_registered "$branch" "start"
+    require_registered "$branch"
 
     local project port worktree_path
     project=$(project_name "$branch")
@@ -266,7 +266,7 @@ cmd_list() {
 
 cmd_shell() {
     local branch="${1:?Branch name required. Usage: sandbox shell <branch>}"
-    require_registered "$branch" "shell"
+    require_registered "$branch"
 
     local slug
     slug=$(registry_get "$branch" "slug")

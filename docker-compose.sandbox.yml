@@ -129,6 +129,8 @@ services:
             SESSION_RECORDING_V2_S3_ENDPOINT: 'http://objectstorage:19000'
 
             # --- Persons DB ---
+            # Multiple env var names because Django, nodejs, and Rust services
+            # each read a different config key for the same connection.
             PERSONS_DB_WRITER_URL: 'postgres://posthog:posthog@db:5432/posthog_persons'
             PERSONS_DB_READER_URL: 'postgres://posthog:posthog@db:5432/posthog_persons'
             PERSONS_WRITE_DATABASE_URL: 'postgres://posthog:posthog@db:5432/posthog_persons'
@@ -140,6 +142,7 @@ services:
             # --- Rust services ---
             COOKIELESS_REDIS_HOST: 'redis7'
             COOKIELESS_REDIS_PORT: '6379'
+            AI_S3_ENDPOINT: 'http://objectstorage:19000'
 
             # --- NodeJS plugin server ---
             CDP_REDIS_HOST: 'redis7'
