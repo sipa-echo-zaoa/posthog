@@ -1,5 +1,6 @@
-# Dev sandbox image — uses the same Python base and uv version as the production
-# Dockerfile (posthog-build stage) so version pins stay in sync.
+# Dev sandbox image for isolated branch environments.
+#
+# Python base and uv version match the production Dockerfile so pins stay in sync.
 # PostHog source is NOT baked in — it's mounted from a host worktree at runtime.
 
 # Same base as the posthog-build stage in Dockerfile
@@ -10,7 +11,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.10.2 /uv /uvx /usr/local/bin/
 
 SHELL ["/bin/bash", "-e", "-o", "pipefail", "-c"]
 
-# System deps needed for building Python packages + dev tools
+# System deps for building Python packages + dev tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     brotli \
     build-essential \
@@ -29,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Same Node.js version as Dockerfile (NODE_VERSION)
+# Same Node.js version as Dockerfile
 ENV NODE_VERSION=24.13.0
 RUN ARCH=$(dpkg --print-architecture) && \
     case "${ARCH}" in \
@@ -40,7 +41,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
     curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
     | tar xJ -C /usr/local --strip-components=1 --no-same-owner
 
-# pnpm
+# pnpm (version determined by corepack from package.json)
 RUN corepack enable && corepack prepare pnpm@latest --activate
 
 # mprocs (process manager used by bin/start)
@@ -65,14 +66,15 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get update && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Rust toolchain (needed for cyclotron-node native addon and Rust services)
+# Rust toolchain (cyclotron-node native addon + Rust services)
+# Installed to /usr/local so non-root container users can access cargo
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH="/usr/local/cargo/bin:$PATH"
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path \
     && chmod -R a+rwx /usr/local/cargo /usr/local/rustup
 
-# Rust build dependencies
+# Rust native build deps (cmake for librdkafka, protobuf for gRPC)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     libclang-dev \
@@ -83,7 +85,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV NODE_ENV=development
 WORKDIR /workspace
 
-COPY bin/sandbox-entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
-RUN chmod +x /usr/local/bin/sandbox-entrypoint.sh
-
+COPY --chmod=755 bin/sandbox-entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/sandbox-entrypoint.sh"]

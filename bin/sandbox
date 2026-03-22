@@ -1,8 +1,13 @@
 #!/bin/bash
+#
+# Manages isolated dev sandboxes — each branch gets its own
+# Docker Compose project with fully independent infrastructure.
+#
+# Usage: sandbox <command> [arguments]
+# Run `sandbox help` for details.
 
 set -e
 
-# Source utility functions
 source "$(dirname "$0")/helpers/_utils.sh"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -10,23 +15,21 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 REGISTRY_DIR="${HOME}/.posthog-sandboxes"
 REGISTRY_FILE="${REGISTRY_DIR}/registry.json"
 SANDBOX_COMPOSE_FILE="${REPO_ROOT}/docker-compose.sandbox.yml"
-WORKTREE_BASE="${POSTHOG_WORKTREE_BASE:-${HOME}/.worktrees/posthog}"
 PORT_BASE=48001
 
-# Ensure registry exists
+# ---------------------------------------------------------------------------
+# Registry helpers — persistent JSON store at ~/.posthog-sandboxes/registry.json
+# ---------------------------------------------------------------------------
+
 ensure_registry() {
     mkdir -p "$REGISTRY_DIR"
-    if [[ ! -f "$REGISTRY_FILE" ]]; then
-        echo '{}' > "$REGISTRY_FILE"
-    fi
+    [[ -f "$REGISTRY_FILE" ]] || echo '{}' > "$REGISTRY_FILE"
 }
 
-# Slugify branch name for use as compose project name
 slugify() {
     echo "$1" | tr '/' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g'
 }
 
-# Get next available port
 next_port() {
     ensure_registry
     local max_port=$PORT_BASE
@@ -38,48 +41,66 @@ next_port() {
     echo "$max_port"
 }
 
-# Save sandbox to registry
 registry_save() {
-    local branch="$1"
-    local slug="$2"
-    local port="$3"
-    local worktree_path="$4"
-
+    local branch="$1" slug="$2" port="$3" worktree_path="$4"
     ensure_registry
-    local tmp=$(mktemp)
+    local tmp
+    tmp=$(mktemp)
     jq --arg b "$branch" --arg s "$slug" --arg p "$port" --arg w "$worktree_path" \
         '.[$b] = {slug: $s, port: ($p | tonumber), worktree: $w}' \
         "$REGISTRY_FILE" > "$tmp" && mv "$tmp" "$REGISTRY_FILE"
 }
 
-# Remove sandbox from registry
 registry_remove() {
     local branch="$1"
     ensure_registry
-    local tmp=$(mktemp)
+    local tmp
+    tmp=$(mktemp)
     jq --arg b "$branch" 'del(.[$b])' "$REGISTRY_FILE" > "$tmp" && mv "$tmp" "$REGISTRY_FILE"
 }
 
-# Look up sandbox info
 registry_get() {
-    local branch="$1"
-    local field="$2"
+    local branch="$1" field="$2"
     ensure_registry
     jq -r --arg b "$branch" --arg f "$field" '.[$b][$f] // empty' "$REGISTRY_FILE"
 }
 
-# Get compose project name for a branch
+# Resolve compose project name for a branch
 project_name() {
     local branch="$1"
     local slug
     slug=$(registry_get "$branch" "slug")
-    if [[ -z "$slug" ]]; then
-        slug=$(slugify "$branch")
-    fi
+    [[ -z "$slug" ]] && slug=$(slugify "$branch")
     echo "sandbox-${slug}"
 }
 
-# --- Subcommands ---
+# Require a branch to exist in the registry; fatal if not found.
+require_registered() {
+    local branch="$1" cmd="$2"
+    local port
+    port=$(registry_get "$branch" "port")
+    if [[ -z "$port" ]]; then
+        fatal "No sandbox found for branch '${branch}'. Create one with: sandbox create ${branch}"
+    fi
+}
+
+# Common env vars passed to every docker compose invocation.
+# Usage: compose_env <port> <worktree_path> <command...>
+compose_env() {
+    local port="$1" worktree_path="$2"
+    shift 2
+    local vite_port=$((port + 1000))
+    SANDBOX_PORT="$port" \
+    SANDBOX_VITE_PORT="$vite_port" \
+    SANDBOX_CODE="$worktree_path" \
+    SANDBOX_UID="$(id -u)" \
+    SANDBOX_GID="$(id -g)" \
+    "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
 
 cmd_create() {
     local branch="${1:?Branch name required. Usage: sandbox create <branch> [base-branch]}"
@@ -89,11 +110,9 @@ cmd_create() {
     slug=$(slugify "$branch")
     local project="sandbox-${slug}"
 
-    # Check if sandbox already exists
-    local existing_port
-    existing_port=$(registry_get "$branch" "port")
-    if [[ -n "$existing_port" ]]; then
-        error "Sandbox already exists for branch '${branch}' on port ${existing_port}"
+    # Guard against duplicate creation
+    if [[ -n "$(registry_get "$branch" "port")" ]]; then
+        error "Sandbox already exists for branch '${branch}' on port $(registry_get "$branch" "port")"
         echo "Use 'sandbox start ${branch}' to start it, or 'sandbox destroy ${branch}' first."
         exit 1
     fi
@@ -108,10 +127,8 @@ cmd_create() {
     if [[ -n "$worktree_path" ]]; then
         print_color blue "Reusing existing worktree at ${worktree_path}"
     else
-        # Fetch latest from origin so we can find remote branches
         git fetch origin --quiet 2>/dev/null || true
 
-        # Check if the branch already exists (local or remote)
         if git show-ref --verify --quiet "refs/heads/${branch}" 2>/dev/null || \
            git show-ref --verify --quiet "refs/remotes/origin/${branch}" 2>/dev/null; then
             print_color blue "Checking out existing branch ${branch}..."
@@ -123,31 +140,26 @@ cmd_create() {
         worktree_path=$(git worktree list | grep -E "\[${branch}\]$" | awk '{print $1}')
     fi
 
-    if [[ -z "$worktree_path" ]] || [[ ! -d "$worktree_path" ]]; then
+    if [[ -z "$worktree_path" || ! -d "$worktree_path" ]]; then
         fatal "Worktree not found for branch '${branch}'"
     fi
-
-    # Verify the worktree is a valid git checkout
     if [[ ! -f "${worktree_path}/manage.py" ]]; then
         fatal "Worktree at ${worktree_path} does not contain PostHog code"
     fi
 
-    # Save to registry
     registry_save "$branch" "$slug" "$port" "$worktree_path"
 
-    # Start compose project
     local vite_port=$((port + 1000))
     print_color blue "Starting sandbox '${project}' on port ${port} (Vite: ${vite_port})..."
-    SANDBOX_PORT="$port" SANDBOX_VITE_PORT="$vite_port" SANDBOX_CODE="$worktree_path" \
-    SANDBOX_UID="$(id -u)" SANDBOX_GID="$(id -g)" \
+    compose_env "$port" "$worktree_path" \
         docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" up -d --build
 
-    # Wait for app to be ready
+    # Wait for Django to start accepting requests
     print_color blue "Waiting for PostHog to start..."
     local max_wait=300
     local elapsed=0
     while [[ $elapsed -lt $max_wait ]]; do
-        if curl -sf "http://localhost:${port}/_healthz" > /dev/null 2>&1; then
+        if curl -sf "http://localhost:${port}/_health" > /dev/null 2>&1; then
             break
         fi
         sleep 5
@@ -168,6 +180,8 @@ cmd_create() {
 
 cmd_stop() {
     local branch="${1:?Branch name required. Usage: sandbox stop <branch>}"
+    require_registered "$branch" "stop"
+
     local project
     project=$(project_name "$branch")
 
@@ -179,22 +193,16 @@ cmd_stop() {
 
 cmd_start() {
     local branch="${1:?Branch name required. Usage: sandbox start <branch>}"
-    local project
+    require_registered "$branch" "start"
+
+    local project port worktree_path
     project=$(project_name "$branch")
-    local port
     port=$(registry_get "$branch" "port")
-
-    if [[ -z "$port" ]]; then
-        fatal "No sandbox found for branch '${branch}'. Create one with: sandbox create ${branch}"
-    fi
-
-    local worktree_path
     worktree_path=$(registry_get "$branch" "worktree")
 
     local vite_port=$((port + 1000))
     print_color blue "Starting sandbox '${project}' on port ${port} (Vite: ${vite_port})..."
-    SANDBOX_PORT="$port" SANDBOX_VITE_PORT="$vite_port" SANDBOX_CODE="$worktree_path" \
-    SANDBOX_UID="$(id -u)" SANDBOX_GID="$(id -g)" \
+    compose_env "$port" "$worktree_path" \
         docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" up -d
 
     success "PostHog running at http://localhost:${port}"
@@ -202,6 +210,7 @@ cmd_start() {
 
 cmd_destroy() {
     local branch="${1:?Branch name required. Usage: sandbox destroy <branch>}"
+
     local project
     project=$(project_name "$branch")
 
@@ -215,13 +224,8 @@ cmd_destroy() {
             "rm -rf /cleanup/node_modules /cleanup/.venv /cleanup/.pnpm-store" 2>/dev/null || true
     fi
 
-    # Stop and remove containers + volumes
     docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" down -v 2>/dev/null || true
-
-    # Remove worktree
     "${SCRIPT_DIR}/posthog-worktree" remove "$branch" 2>/dev/null || true
-
-    # Remove from registry
     registry_remove "$branch"
 
     success "Sandbox destroyed."
@@ -241,14 +245,12 @@ cmd_list() {
     printf "%-40s %-8s %-10s %-s\n" "BRANCH" "PORT" "STATUS" "URL"
     printf "%-40s %-8s %-10s %-s\n" "------" "----" "------" "---"
 
+    local branch port slug project running status url
     while IFS= read -r branch; do
-        local port slug project status url
         port=$(registry_get "$branch" "port")
         slug=$(registry_get "$branch" "slug")
         project="sandbox-${slug}"
 
-        # Check if containers are running
-        local running
         running=$(docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" ps --status running -q 2>/dev/null | wc -l | tr -d ' ')
         if [[ "$running" -gt 0 ]]; then
             status="running"
@@ -264,11 +266,11 @@ cmd_list() {
 
 cmd_shell() {
     local branch="${1:?Branch name required. Usage: sandbox shell <branch>}"
+    require_registered "$branch" "shell"
+
     local slug
     slug=$(registry_get "$branch" "slug")
-    if [[ -z "$slug" ]]; then
-        slug=$(slugify "$branch")
-    fi
+    [[ -z "$slug" ]] && slug=$(slugify "$branch")
 
     local container="sandbox-${slug}-app-1"
     print_color blue "Attaching to mprocs in ${container}... (detach with Ctrl-b d)"
@@ -277,40 +279,29 @@ cmd_shell() {
 
 cmd_logs() {
     local branch="${1:?Branch name required. Usage: sandbox logs <branch>}"
+
     local project
     project=$(project_name "$branch")
 
     docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" logs -f app
 }
 
-# --- Main ---
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 COMMAND="${1:-help}"
 shift || true
 
 case "$COMMAND" in
-    create)
-        cmd_create "$@"
-        ;;
-    stop)
-        cmd_stop "$@"
-        ;;
-    start)
-        cmd_start "$@"
-        ;;
-    destroy)
-        cmd_destroy "$@"
-        ;;
-    list|ls)
-        cmd_list
-        ;;
-    shell)
-        cmd_shell "$@"
-        ;;
-    logs)
-        cmd_logs "$@"
-        ;;
-    help|*)
+    create)  cmd_create "$@" ;;
+    stop)    cmd_stop "$@" ;;
+    start)   cmd_start "$@" ;;
+    destroy) cmd_destroy "$@" ;;
+    list|ls) cmd_list ;;
+    shell)   cmd_shell "$@" ;;
+    logs)    cmd_logs "$@" ;;
+    help)
         echo "PostHog Dev Sandbox Manager"
         echo ""
         echo "Usage: sandbox <command> [arguments]"
@@ -321,7 +312,7 @@ case "$COMMAND" in
         echo "  stop <branch>                   Stop a sandbox (preserves state)"
         echo "  destroy <branch>                Destroy a sandbox and clean up"
         echo "  list                            List all sandboxes"
-        echo "  shell <branch>                  Open a shell in a sandbox"
+        echo "  shell <branch>                  Attach to the mprocs UI"
         echo "  logs <branch>                   Tail logs from a sandbox"
         echo ""
         echo "Examples:"
@@ -332,5 +323,10 @@ case "$COMMAND" in
         echo "  sandbox stop aspicer/cool-feature"
         echo "  sandbox start aspicer/cool-feature"
         echo "  sandbox destroy aspicer/cool-feature"
+        ;;
+    *)
+        error "Unknown command: ${COMMAND}"
+        echo "Run 'sandbox help' for usage."
+        exit 1
         ;;
 esac
