@@ -734,6 +734,12 @@ sandbox:
     sandbox:logs:
         bin_script: sandbox
         description: Tail logs from a sandbox
+    sandbox:rebuild-cache:
+        bin_script: sandbox
+        description: Rebuild the database cache from master
+    sandbox:nuke:
+        bin_script: sandbox
+        description: Destroy all sandboxes and rebuild the cache
 environment:
     flox:activate:
         cmd: flox activate

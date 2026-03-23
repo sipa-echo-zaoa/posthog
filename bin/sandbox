@@ -473,7 +473,7 @@ cmd_logs() {
         docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" logs -f app
 }
 
-cmd_clear_cache() {
+cmd_rebuild_cache() {
     print_color blue "Clearing database cache..."
 
     # Wipe everything in the cache volume (including hidden marker files).
@@ -482,7 +482,7 @@ cmd_clear_cache() {
     # Re-create writable directory for ClickHouse backups.
     docker run --rm -v sandbox-db-cache:/data alpine chmod 777 /data
 
-    success "Database cache cleared. The next 'sandbox create' will run full migrations and cache the result."
+    _init_cache_from_master
 }
 
 cmd_nuke() {
@@ -498,9 +498,9 @@ cmd_nuke() {
         done <<< "$branches"
     fi
 
-    cmd_clear_cache
+    cmd_rebuild_cache
 
-    success "All sandboxes destroyed and cache cleared."
+    success "All sandboxes destroyed and cache rebuilt."
 }
 
 # ---------------------------------------------------------------------------
@@ -518,7 +518,7 @@ case "$COMMAND" in
     list|ls)          cmd_list ;;
     shell)            cmd_shell "$@" ;;
     logs)             cmd_logs "$@" ;;
-    clear-cache)      cmd_clear_cache ;;
+    rebuild-cache)    cmd_rebuild_cache ;;
     nuke)             cmd_nuke ;;
     help)
         echo "PostHog Dev Sandbox Manager"
@@ -533,7 +533,7 @@ case "$COMMAND" in
         echo "  list                            List all sandboxes"
         echo "  shell <branch>                  Attach to the mprocs UI"
         echo "  logs <branch>                   Tail logs from a sandbox"
-        echo "  clear-cache                     Clear the database cache (next create rebuilds it)"
+        echo "  rebuild-cache                   Rebuild the database cache from master"
         echo "  nuke                            Destroy all sandboxes and clear the cache"
         echo ""
         echo "Examples:"
