@@ -32,13 +32,13 @@ slugify() {
 
 next_port() {
     ensure_registry
-    local max_port=$PORT_BASE
-    while IFS= read -r port; do
-        if [[ "$port" -ge "$max_port" ]]; then
-            max_port=$((port + 1))
-        fi
-    done < <(jq -r '.[].port // empty' "$REGISTRY_FILE" 2>/dev/null)
-    echo "$max_port"
+    local used_ports
+    used_ports=$(jq -r '.[].port // empty' "$REGISTRY_FILE" 2>/dev/null)
+    local port=$PORT_BASE
+    while echo "$used_ports" | grep -qxF "$port"; do
+        port=$((port + 1))
+    done
+    echo "$port"
 }
 
 registry_save() {
@@ -102,6 +102,79 @@ compose_env() {
 # Subcommands
 # ---------------------------------------------------------------------------
 
+# Build the database cache from a temporary master checkout.
+# Called automatically on first sandbox create so every branch benefits.
+# Teardown helper for cache init — always called before exit/fatal.
+_cleanup_cache_init() {
+    local port="$1" worktree="$2"
+    compose_env "$port" "$worktree" \
+        docker compose -p sandbox-cache-init -f "$SANDBOX_COMPOSE_FILE" down -v 2>/dev/null || true
+    rm -rf "$worktree"
+    git worktree prune 2>/dev/null || true
+}
+
+_init_cache_from_master() {
+    print_color blue "No database cache found. Building from master (one-time setup, ~10 min)..."
+
+    local init_project="sandbox-cache-init"
+    local init_port=47999
+    local init_worktree="/tmp/sandbox-cache-init"
+
+    rm -rf "$init_worktree"
+
+    git fetch origin master --quiet 2>/dev/null || true
+    git worktree add --detach "$init_worktree" origin/master \
+        || fatal "Could not check out master for cache init."
+
+    # Pre-merge overlay for ClickHouse backup config
+    mkdir -p "${init_worktree}/docker/clickhouse/config.d"
+    cp "${REPO_ROOT}/docker/clickhouse/config.d/sandbox-backup.xml" \
+        "${init_worktree}/docker/clickhouse/config.d/sandbox-backup.xml"
+
+    compose_env "$init_port" "$init_worktree" \
+        docker compose -p "$init_project" -f "$SANDBOX_COMPOSE_FILE" up -d --build
+
+    print_color blue "Waiting for master to boot..."
+    local max_wait=1800 elapsed=0
+    while [[ $elapsed -lt $max_wait ]]; do
+        if curl -sf "http://localhost:${init_port}/_health" > /dev/null 2>&1; then
+            break
+        fi
+        sleep 10
+        elapsed=$((elapsed + 10))
+        if (( elapsed % 30 == 0 )); then
+            echo "  ... still waiting (${elapsed}s)"
+        fi
+    done
+
+    if [[ $elapsed -ge $max_wait ]]; then
+        _cleanup_cache_init "$init_port" "$init_worktree"
+        fatal "Cache init timed out after ${max_wait}s. Check docker logs for errors."
+    fi
+
+    # Cache postgres: stop for consistent snapshot
+    compose_env "$init_port" "$init_worktree" \
+        docker compose -p "$init_project" -f "$SANDBOX_COMPOSE_FILE" stop db
+    docker run --rm \
+        -v "${init_project}_postgres-data:/src:ro" \
+        -v sandbox-db-cache:/dst \
+        alpine sh -c "rm -rf /dst/postgres && cp -a /src /dst/postgres"
+
+    # Cache ClickHouse
+    local ch_container="${init_project}-clickhouse-1"
+    docker exec "$ch_container" clickhouse-client \
+        --query "BACKUP DATABASE posthog TO Disk('sandbox_cache', 'posthog/')" \
+        || { _cleanup_cache_init "$init_port" "$init_worktree"; fatal "ClickHouse backup failed during cache init."; }
+
+    local cache_hash
+    cache_hash=$(git -C "$init_worktree" rev-parse HEAD 2>/dev/null || echo "unknown")
+    docker run --rm -v sandbox-db-cache:/dst alpine \
+        sh -c "echo '${cache_hash}' > /dst/.cache-commit && touch /dst/.cache-ready"
+
+    _cleanup_cache_init "$init_port" "$init_worktree"
+    success "Database cache built from master."
+}
+
 cmd_create() {
     local branch="${1:?Branch name required. Usage: sandbox create <branch> [base-branch]}"
     local base_branch="${2:-master}"
@@ -154,21 +227,50 @@ cmd_create() {
     docker volume create sandbox-pnpm-store >/dev/null 2>&1 || true
     docker volume create sandbox-db-cache   >/dev/null 2>&1 || true
     # Ensure cache volume is writable by any UID (clickhouse runs as UID 101).
-    docker run --rm -v sandbox-db-cache:/data alpine chmod 777 /data 2>/dev/null || true
+    docker run --rm -v sandbox-db-cache:/data alpine chmod 777 /data
 
     # Ensure ClickHouse backup config exists in the worktree (needed before ClickHouse starts).
     # Pre-merge branches won't have this file, so copy it from the main repo.
     mkdir -p "${worktree_path}/docker/clickhouse/config.d"
     cp "${REPO_ROOT}/docker/clickhouse/config.d/sandbox-backup.xml" \
-        "${worktree_path}/docker/clickhouse/config.d/sandbox-backup.xml" 2>/dev/null || true
+        "${worktree_path}/docker/clickhouse/config.d/sandbox-backup.xml"
 
-    # Pre-populate postgres from cache if available.
-    # Postgres data directory is self-contained — volume copy is safe and fast.
-    # ClickHouse is restored via BACKUP/RESTORE SQL after services start (see below).
+    # Ensure the database cache exists. On first run, this boots a temporary
+    # master stack, generates demo data, and snapshots both databases.
     local cache_ready
     cache_ready=$(docker run --rm -v sandbox-db-cache:/cache:ro alpine \
         sh -c "[ -f /cache/.cache-ready ] && echo yes || echo no" 2>/dev/null || echo no)
 
+    if [[ "$cache_ready" == "no" ]]; then
+        _init_cache_from_master || fatal "Cache init from master failed. Fix the issue and try again."
+        cache_ready="yes"
+    fi
+
+    # Check if the branch might be behind the cached database state.
+    local cache_commit
+    cache_commit=$(docker run --rm -v sandbox-db-cache:/cache:ro alpine \
+        cat /cache/.cache-commit 2>/dev/null || echo "")
+    if [[ -n "$cache_commit" ]]; then
+        local branch_head
+        branch_head=$(git -C "$worktree_path" rev-parse HEAD 2>/dev/null || echo "")
+        if [[ -n "$branch_head" ]] && ! git merge-base --is-ancestor "$cache_commit" "$branch_head" 2>/dev/null; then
+            print_color yellow "Your branch appears to be behind the database cache."
+            echo "The cache was built from a commit not in your branch's history."
+            echo "This can cause issues if database migrations have changed."
+            echo ""
+            echo "  [c] Use cache anyway (usually fine)"
+            echo "  [f] Skip cache and build from scratch (~10 min)"
+            echo "  [q] Quit and merge master first"
+            echo ""
+            read -rp "Choice [c/f/q]: " choice
+            case "$choice" in
+                f|F) cache_ready="skip" ;;
+                q|Q) exit 0 ;;
+            esac
+        fi
+    fi
+
+    # Restore databases from cache.
     if [[ "$cache_ready" == "yes" ]]; then
         print_color blue "Restoring postgres from cache..."
         docker volume create "${project}_postgres-data" >/dev/null 2>&1 || true
@@ -180,13 +282,15 @@ cmd_create() {
 
     local vite_port=$((port + 1000))
     print_color blue "Starting sandbox '${project}' on port ${port} (Vite: ${vite_port})..."
-    compose_env "$port" "$worktree_path" \
-        docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" up -d --build
 
-    # Restore ClickHouse from backup if cache exists.
-    # Must happen after compose up (ClickHouse needs to be running to accept RESTORE).
-    # Wait for ClickHouse to be healthy first.
     if [[ "$cache_ready" == "yes" ]]; then
+        # Start infra services first so we can RESTORE ClickHouse before the
+        # app runs migrations. This avoids a race between RESTORE and
+        # migrate_clickhouse which both touch the same tables.
+        compose_env "$port" "$worktree_path" \
+            docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" up -d \
+            db redis7 clickhouse kafka zookeeper objectstorage elasticsearch temporal
+
         print_color blue "Waiting for ClickHouse to be ready..."
         local ch_container="${project}-clickhouse-1"
         local ch_elapsed=0
@@ -205,11 +309,18 @@ cmd_create() {
         else
             echo "WARNING: ClickHouse restore failed — migrations will recreate tables."
         fi
+
+        # Now start app + proxy — migrations run against the restored data.
+        compose_env "$port" "$worktree_path" \
+            docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" up -d --build
+    else
+        # User chose to skip cache — cold boot.
+        compose_env "$port" "$worktree_path" \
+            docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" up -d --build
     fi
 
     # Wait for Django to start accepting requests.
-    # Cold boots take 10-15 min (deps install, migrations, Rust compilation).
-    print_color blue "Waiting for PostHog to start (cold boot can take 10-15 min)..."
+    print_color blue "Waiting for PostHog to start..."
     local max_wait=1800
     local elapsed=0
     while [[ $elapsed -lt $max_wait ]]; do
@@ -218,7 +329,6 @@ cmd_create() {
         fi
         sleep 10
         elapsed=$((elapsed + 10))
-        # Show progress every 30s to avoid wall of noise
         if (( elapsed % 30 == 0 )); then
             echo "  ... still waiting (${elapsed}s)"
         fi
@@ -233,33 +343,6 @@ cmd_create() {
         exit 1
     fi
 
-    # Build cache from this sandbox if no cache exists yet.
-    # Postgres: stop, volume copy, restart (filesystem snapshot).
-    # ClickHouse: BACKUP SQL (consistent snapshot while running, excludes Kafka engine tables).
-    if [[ "$cache_ready" != "yes" ]]; then
-        print_color blue "Building database cache for future sandboxes..."
-
-        # Postgres: stop for consistent copy, then restart
-        compose_env "$port" "$worktree_path" \
-            docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" stop db
-        docker run --rm \
-            -v "${project}_postgres-data:/src:ro" \
-            -v sandbox-db-cache:/dst \
-            alpine sh -c "rm -rf /dst/postgres && cp -a /src /dst/postgres"
-        compose_env "$port" "$worktree_path" \
-            docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" start db
-
-        # ClickHouse: BACKUP while running (no stop needed)
-        local ch_container="${project}-clickhouse-1"
-        if docker exec "$ch_container" clickhouse-client \
-            --query "BACKUP DATABASE posthog TO Disk('sandbox_cache', 'posthog/')" 2>/dev/null; then
-            docker run --rm -v sandbox-db-cache:/dst alpine touch /dst/.cache-ready
-            success "Database cache built. Future sandboxes will start faster."
-        else
-            echo "WARNING: ClickHouse backup failed. Cache will be incomplete."
-        fi
-    fi
-
     success "PostHog running at http://localhost:${port}"
     print_color blue "Worktree: ${worktree_path}"
     print_color blue "Shell:    sandbox shell ${branch}"
@@ -270,11 +353,14 @@ cmd_stop() {
     local branch="${1:?Branch name required. Usage: sandbox stop <branch>}"
     require_registered "$branch"
 
-    local project
+    local project port worktree_path
     project=$(project_name "$branch")
+    port=$(registry_get "$branch" "port")
+    worktree_path=$(registry_get "$branch" "worktree")
 
     print_color blue "Stopping sandbox '${project}'..."
-    docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" stop
+    compose_env "$port" "$worktree_path" \
+        docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" stop
 
     success "Sandbox stopped. Volumes preserved."
 }
@@ -299,19 +385,20 @@ cmd_start() {
 cmd_destroy() {
     local branch="${1:?Branch name required. Usage: sandbox destroy <branch>}"
 
-    local project
+    local project port worktree_path
     project=$(project_name "$branch")
+    port=$(registry_get "$branch" "port")
+    worktree_path=$(registry_get "$branch" "worktree")
 
     print_color yellow "Destroying sandbox '${project}'..."
 
     # Stop containers and remove per-sandbox volumes.
-    docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" down -v 2>/dev/null || true
+    compose_env "${port:-0}" "${worktree_path:-.}" \
+        docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" down -v 2>/dev/null || true
 
     # Remove the worktree directory. Containers may have created files owned
     # by root or other UIDs (e.g. clickhouse UID 101), so we use a container
     # to delete contents, then rmdir the empty directory from the host.
-    local worktree_path
-    worktree_path=$(registry_get "$branch" "worktree")
     if [[ -n "$worktree_path" && -d "$worktree_path" ]]; then
         docker run --rm -v "${worktree_path}:/cleanup" alpine \
             sh -c "find /cleanup -mindepth 1 -delete" 2>/dev/null || true
@@ -375,11 +462,15 @@ cmd_shell() {
 
 cmd_logs() {
     local branch="${1:?Branch name required. Usage: sandbox logs <branch>}"
+    require_registered "$branch"
 
-    local project
+    local project port worktree_path
     project=$(project_name "$branch")
+    port=$(registry_get "$branch" "port")
+    worktree_path=$(registry_get "$branch" "worktree")
 
-    docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" logs -f app
+    compose_env "$port" "$worktree_path" \
+        docker compose -p "$project" -f "$SANDBOX_COMPOSE_FILE" logs -f app
 }
 
 cmd_clear_cache() {
@@ -413,83 +504,11 @@ cmd_nuke() {
 }
 
 # ---------------------------------------------------------------------------
-# Shell completions
-# ---------------------------------------------------------------------------
-
-# List registered sandbox branch names (one per line).
-_sandbox_branches() {
-    ensure_registry
-    jq -r 'keys[]' "$REGISTRY_FILE" 2>/dev/null
-}
-
-_SANDBOX_ALL_CMDS="create start stop destroy list ls shell logs clear-cache nuke help"
-
-# Internal handler: called as `sandbox --complete <cword> <words...>`
-# Outputs completion candidates, one per line.
-cmd_complete() {
-    local cword="${1:-1}"
-    shift || true
-    local words=("$@")
-
-    if [[ "$cword" -le 1 ]]; then
-        echo "$_SANDBOX_ALL_CMDS" | tr ' ' '\n'
-        return
-    fi
-
-    local subcmd="${words[1]:-}"
-    if [[ "$cword" -eq 2 ]]; then
-        case "$subcmd" in
-            create)
-                git branch -a 2>/dev/null \
-                    | grep -v HEAD \
-                    | sed 's/^[* ]*//' \
-                    | sed 's|remotes/origin/||' \
-                    | sort -u
-                ;;
-            start|stop|destroy|shell|logs)
-                _sandbox_branches
-                ;;
-        esac
-    elif [[ "$cword" -eq 3 && "$subcmd" == "create" ]]; then
-        git branch 2>/dev/null | sed 's/^[* ]*//' | sort -u
-    fi
-}
-
-# Auto-install bash completion file so TAB works without any user setup.
-install_completions() {
-    local completion_dir="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"
-    local completion_file="${completion_dir}/sandbox"
-    local sandbox_path="${SCRIPT_DIR}/sandbox"
-
-    # Skip if already installed and pointing at the same script
-    if [[ -f "$completion_file" ]] && grep -q "$sandbox_path" "$completion_file" 2>/dev/null; then
-        return
-    fi
-
-    mkdir -p "$completion_dir"
-    cat > "$completion_file" <<BASH
-# Auto-generated by bin/sandbox — do not edit
-_sandbox_complete() {
-    local cur="\${COMP_WORDS[COMP_CWORD]}"
-    local candidates
-    candidates=\$("$sandbox_path" --complete "\$COMP_CWORD" "\${COMP_WORDS[@]}" 2>/dev/null)
-    COMPREPLY=(\$(compgen -W "\$candidates" -- "\$cur"))
-}
-complete -o default -F _sandbox_complete sandbox
-BASH
-}
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 COMMAND="${1:-help}"
 shift || true
-
-# Auto-install shell completions (skips quickly if already done).
-if [[ "$COMMAND" != "--complete" ]]; then
-    install_completions 2>/dev/null || true
-fi
 
 case "$COMMAND" in
     create)           cmd_create "$@" ;;
@@ -501,7 +520,6 @@ case "$COMMAND" in
     logs)             cmd_logs "$@" ;;
     clear-cache)      cmd_clear_cache ;;
     nuke)             cmd_nuke ;;
-    --complete)       cmd_complete "$@" ;;
     help)
         echo "PostHog Dev Sandbox Manager"
         echo ""
