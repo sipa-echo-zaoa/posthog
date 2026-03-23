@@ -50,7 +50,7 @@ echo "==> Installing Node dependencies..."
 # CI=1 suppresses interactive prompts (e.g. "reinstall from scratch? Y/n")
 # that hang when there's no TTY. The worktree may already have partial
 # node_modules from posthog-worktree setup.
-CI=1 pnpm install --frozen-lockfile --prefer-offline 2>&1 || CI=1 pnpm install 2>&1
+CI=1 pnpm install
 
 echo "==> Running database migrations..."
 python manage.py sandbox_migrate
