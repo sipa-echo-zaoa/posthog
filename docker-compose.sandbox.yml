@@ -100,7 +100,6 @@ services:
             # uv and pnpm download packages here; subsequent sandboxes get cache hits.
             - uv-cache:/cache/uv
             - pnpm-store:/cache/pnpm
-            - pg-cache:/cache/pgdump
         environment:
             # --- Sandbox identity ---
             POSTHOG_SANDBOX: '1'
@@ -109,10 +108,10 @@ services:
             SKIP_SERVICE_VERSION_REQUIREMENTS: '1'
             IS_BEHIND_PROXY: 'true'
             DISABLE_SECURE_SSL_REDIRECT: 'true'
-            # Unique cookie names per sandbox so multiple sandboxes on localhost
-            # don't overwrite each other's session/CSRF cookies.
+            # Unique session cookie per sandbox so multiple sandboxes on localhost
+            # don't overwrite each other's login sessions.
+            # (CSRF cookie is NOT varied — frontend hardcodes 'posthog_csrftoken'.)
             SESSION_COOKIE_NAME: 'sessionid_${SANDBOX_PORT:-48001}'
-            CSRF_COOKIE_NAME: 'csrftoken_${SANDBOX_PORT:-48001}'
 
             # --- Core datastores (point at compose services, not localhost) ---
             DATABASE_URL: 'postgres://posthog:posthog@db:5432/posthog'
@@ -229,12 +228,15 @@ services:
             retries: 10
         volumes:
             - clickhouse-data:/var/lib/clickhouse
+            # Shared cache volume for ClickHouse BACKUP/RESTORE
+            - db-cache:/cache/chbackup
             # Config from the worktree (read-only — sandbox ClickHouse never writes these)
             - ${SANDBOX_CODE:-.}/posthog/idl:/idl:ro
             - ${SANDBOX_CODE:-.}/docker/clickhouse/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d:ro
             - ${SANDBOX_CODE:-.}/docker/clickhouse/config.xml:/etc/clickhouse-server/config.xml:ro
             - ${SANDBOX_CODE:-.}/docker/clickhouse/config.d/default.xml:/etc/clickhouse-server/config.d/default.xml:ro
             - ${SANDBOX_CODE:-.}/docker/clickhouse/config.d/dev-memory.xml:/etc/clickhouse-server/config.d/dev-memory.xml:ro
+            - ${SANDBOX_CODE:-.}/docker/clickhouse/config.d/sandbox-backup.xml:/etc/clickhouse-server/config.d/sandbox-backup.xml:ro
             - ${SANDBOX_CODE:-.}/docker/clickhouse/users-dev.xml:/etc/clickhouse-server/users.xml:ro
             - ${SANDBOX_CODE:-.}/docker/clickhouse/user_defined_function.xml:/etc/clickhouse-server/user_defined_function.xml:ro
             - ${SANDBOX_CODE:-.}/posthog/user_scripts:/var/lib/clickhouse/user_scripts:ro
@@ -341,6 +343,6 @@ volumes:
     pnpm-store:
         name: sandbox-pnpm-store
         external: true
-    pg-cache:
-        name: sandbox-pg-cache
+    db-cache:
+        name: sandbox-db-cache
         external: true

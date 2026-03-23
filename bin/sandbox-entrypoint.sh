@@ -14,8 +14,12 @@ cp /usr/local/share/sandbox/bin/wait-for-docker    bin/wait-for-docker
 cp /usr/local/share/sandbox/bin/mprocs.yaml        bin/mprocs.yaml
 cp /usr/local/share/sandbox/bin/start-backend      bin/start-backend
 cp /usr/local/share/sandbox/bin/start-rust-service bin/start-rust-service
+cp /usr/local/share/sandbox/posthog/management/commands/sandbox_migrate.py posthog/management/commands/sandbox_migrate.py
 # Fix hardcoded Vite dev server port in older branches (no-op after merge).
 sed -i "s|http://localhost:8234|${JS_URL}|g" posthog/utils.py
+# Add SESSION_COOKIE_NAME env var support if not present (no-op after merge).
+grep -q 'SESSION_COOKIE_NAME.*get_from_env' posthog/settings/web.py || \
+    sed -i '/^CSRF_COOKIE_NAME/i SESSION_COOKIE_NAME = get_from_env("SESSION_COOKIE_NAME", "sessionid")' posthog/settings/web.py
 # --- END PRE-MERGE WORKAROUND ---
 
 # When running as a non-root UID (the default — see docker-compose.sandbox.yml),
@@ -48,41 +52,20 @@ echo "==> Installing Node dependencies..."
 # node_modules from posthog-worktree setup.
 CI=1 pnpm install --frozen-lockfile --prefer-offline 2>&1 || CI=1 pnpm install 2>&1
 
-PG_DUMP="/cache/pgdump/posthog.sql"
-PERSONS_DUMP="/cache/pgdump/posthog_persons.sql"
-
-if [[ -f "$PG_DUMP" ]]; then
-    echo "==> Restoring database from migration cache..."
-    psql -h db -U posthog -d posthog -q < "$PG_DUMP"
-    psql -h db -U posthog -d posthog_persons -q < "$PERSONS_DUMP"
-    echo "==> Running migrations (applying delta, if any)..."
-else
-    echo "==> Running full database migrations (no cache found)..."
-fi
-
-python manage.py migrate --noinput
-python manage.py apply_persons_migrations --database=persons_db_writer --ensure-database
-
-# Cache the migrated database for future sandboxes.
-# Only write the cache if it didn't exist — avoids baking in feature-branch migrations.
-if [[ ! -f "$PG_DUMP" ]]; then
-    echo "==> Caching migrated database for future sandboxes..."
-    pg_dump -h db -U posthog posthog > "$PG_DUMP"
-    pg_dump -h db -U posthog posthog_persons > "$PERSONS_DUMP"
-fi
-
-python manage.py migrate_clickhouse
+echo "==> Running database migrations..."
+python manage.py sandbox_migrate
 
 echo "==> Downloading GeoIP database..."
 bin/download-mmdb || true
 
-# Generate demo data on first boot (creates test@posthog.com / 12345678).
-# Uses a marker file rather than a Django ORM query to avoid a full app startup.
-MARKER="/tmp/sandbox-home/.demo-data-generated"
-if [[ ! -f "$MARKER" ]]; then
+# Generate demo data if the demo user doesn't exist yet (test@posthog.com / 12345678).
+# When database volumes are pre-populated from cache (see bin/sandbox), the user
+# already exists and this is skipped. Checking via SQL avoids a Django cold start.
+if psql -h db -U posthog -d posthog -tAc "SELECT 1 FROM posthog_user WHERE email='test@posthog.com' LIMIT 1" 2>/dev/null | grep -q 1; then
+    echo "==> Demo data already present, skipping generation."
+else
     echo "==> Generating demo data (first boot)..."
     python manage.py generate_demo_data
-    touch "$MARKER"
 fi
 
 echo "==> Starting PostHog via mprocs in tmux..."

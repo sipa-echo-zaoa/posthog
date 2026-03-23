@@ -84,7 +84,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Shared cache directories — mounted as named volumes in docker-compose.sandbox.yml.
 # Created with open permissions so any UID can write (container runs as host user).
-RUN mkdir -p /cache/uv /cache/pnpm /cache/pgdump && chmod 777 /cache/uv /cache/pnpm /cache/pgdump
+RUN mkdir -p /cache/uv /cache/pnpm && chmod 777 /cache/uv /cache/pnpm
 
 ENV NODE_ENV=development
 WORKDIR /workspace
@@ -97,6 +97,7 @@ COPY bin/wait-for-docker     /usr/local/share/sandbox/bin/wait-for-docker
 COPY bin/mprocs.yaml         /usr/local/share/sandbox/bin/mprocs.yaml
 COPY bin/start-backend       /usr/local/share/sandbox/bin/start-backend
 COPY bin/start-rust-service  /usr/local/share/sandbox/bin/start-rust-service
+COPY posthog/management/commands/sandbox_migrate.py /usr/local/share/sandbox/posthog/management/commands/sandbox_migrate.py
 # --- END PRE-MERGE WORKAROUND ---
 
 ENTRYPOINT ["/usr/local/bin/sandbox-entrypoint.sh"]
