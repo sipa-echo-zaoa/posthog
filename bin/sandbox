@@ -110,7 +110,6 @@ _cleanup_cache_init() {
     compose_env "$port" "$worktree" \
         docker compose -p sandbox-cache-init -f "$SANDBOX_COMPOSE_FILE" down -v 2>/dev/null || true
     rm -rf "$worktree"
-    git worktree prune 2>/dev/null || true
 }
 
 _init_cache_from_master() {
@@ -123,7 +122,7 @@ _init_cache_from_master() {
     rm -rf "$init_worktree"
 
     git fetch origin master --quiet
-    git worktree add --detach "$init_worktree" origin/master \
+    git worktree add --force --detach "$init_worktree" origin/master \
         || fatal "Could not check out master for cache init."
 
     # Pre-merge overlay for ClickHouse backup config
